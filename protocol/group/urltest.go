@@ -221,6 +221,11 @@ type URLTestGroup struct {
 	close                        chan struct{}
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
+	// failedUntil excludes a node from selection/probes after a real dial/IO
+	// failure. Without this, CheckOutbounds immediately re-probes generate_204
+	// and resurrects nodes that pass the health URL but fail real TLS (e.g. to
+	// api2.cursor.sh / accounts.google.com).
+	failedUntil map[string]time.Time
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -254,6 +259,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
+		failedUntil:                  make(map[string]time.Time),
 	}, nil
 }
 
@@ -300,14 +306,14 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minOutbound adapter.Outbound
 	switch network {
 	case N.NetworkTCP:
-		if g.selectedOutboundTCP != nil {
+		if g.selectedOutboundTCP != nil && !g.isCooled(RealTag(g.selectedOutboundTCP)) {
 			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP)); history != nil {
 				minOutbound = g.selectedOutboundTCP
 				minDelay = history.Delay
 			}
 		}
 	case N.NetworkUDP:
-		if g.selectedOutboundUDP != nil {
+		if g.selectedOutboundUDP != nil && !g.isCooled(RealTag(g.selectedOutboundUDP)) {
 			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP)); history != nil {
 				minOutbound = g.selectedOutboundUDP
 				minDelay = history.Delay
@@ -315,7 +321,7 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		}
 	}
 	for _, detour := range g.outbounds {
-		if !common.Contains(detour.Network(), network) {
+		if !common.Contains(detour.Network(), network) || g.isCooled(RealTag(detour)) {
 			continue
 		}
 		history := g.history.LoadURLTestHistory(RealTag(detour))
@@ -328,6 +334,13 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		}
 	}
 	if minOutbound == nil {
+		for _, detour := range g.outbounds {
+			if !common.Contains(detour.Network(), network) || g.isCooled(RealTag(detour)) {
+				continue
+			}
+			return detour, false
+		}
+		// Everything cooled: last resort, ignore cooldown so traffic is not blackholed.
 		for _, detour := range g.outbounds {
 			if !common.Contains(detour.Network(), network) {
 				continue
@@ -388,6 +401,12 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		if checked[realTag] {
 			continue
 		}
+		if g.isCooled(realTag) {
+			// Real traffic already failed this node; do not let generate_204
+			// resurrect it until the cooldown expires.
+			g.history.DeleteURLTestHistory(realTag)
+			continue
+		}
 		history := g.history.LoadURLTestHistory(realTag)
 		if !force && history != nil && time.Since(history.Time) < g.interval {
 			continue
@@ -403,6 +422,9 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
+				g.history.DeleteURLTestHistory(realTag)
+			} else if g.isCooled(realTag) {
+				g.logger.Debug("outbound ", tag, " available but in failure cooldown, ignoring probe")
 				g.history.DeleteURLTestHistory(realTag)
 			} else {
 				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
@@ -441,6 +463,24 @@ func (g *URLTestGroup) performUpdateCheck() {
 	}
 }
 
+// urltestFailureCooldownout keeps a node out of Auto after a real dial/IO failure
+// so the periodic generate_204 probe cannot immediately put it back.
+const urltestFailureCooldown = 5 * time.Minute
+
+func (g *URLTestGroup) isCooled(tag string) bool {
+	g.access.Lock()
+	defer g.access.Unlock()
+	until, ok := g.failedUntil[tag]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(g.failedUntil, tag)
+	return false
+}
+
 // pickForDial chooses the next outbound to try, skipping tags already failed in
 // this dial attempt. Prefers the current selection, then lowest urltest delay,
 // then any remaining member — so a dial/IO failure can immediately fail over
@@ -453,16 +493,17 @@ func (g *URLTestGroup) pickForDial(network string, exclude map[string]bool) adap
 	case N.NetworkUDP:
 		preferred = g.selectedOutboundUDP
 	}
-	if preferred != nil && common.Contains(preferred.Network(), network) && !exclude[RealTag(preferred)] {
+	if preferred != nil && common.Contains(preferred.Network(), network) && !exclude[RealTag(preferred)] && !g.isCooled(RealTag(preferred)) {
 		return preferred
 	}
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	for _, detour := range g.outbounds {
-		if !common.Contains(detour.Network(), network) || exclude[RealTag(detour)] {
+		tag := RealTag(detour)
+		if !common.Contains(detour.Network(), network) || exclude[tag] || g.isCooled(tag) {
 			continue
 		}
-		history := g.history.LoadURLTestHistory(RealTag(detour))
+		history := g.history.LoadURLTestHistory(tag)
 		if history == nil {
 			continue
 		}
@@ -475,7 +516,16 @@ func (g *URLTestGroup) pickForDial(network string, exclude map[string]bool) adap
 		return minOutbound
 	}
 	for _, detour := range g.outbounds {
-		if !common.Contains(detour.Network(), network) || exclude[RealTag(detour)] {
+		tag := RealTag(detour)
+		if !common.Contains(detour.Network(), network) || exclude[tag] || g.isCooled(tag) {
+			continue
+		}
+		return detour
+	}
+	// All cooled or excluded: allow a cooled node rather than failing hard.
+	for _, detour := range g.outbounds {
+		tag := RealTag(detour)
+		if !common.Contains(detour.Network(), network) || exclude[tag] {
 			continue
 		}
 		return detour
@@ -492,20 +542,30 @@ func (g *URLTestGroup) setSelected(network string, outbound adapter.Outbound) {
 	}
 }
 
-// markFailed drops the outbound from urltest history and clears it as the
-// sticky selection so the next pick (or a dial retry in the same call) moves on.
+// markFailed drops the outbound from urltest history, puts it in cooldown, and
+// clears sticky selection. Does NOT force an immediate urltest — that would
+// re-probe generate_204 and undo the failure.
 func (g *URLTestGroup) markFailed(outbound adapter.Outbound) {
 	if outbound == nil {
 		return
 	}
-	g.history.DeleteURLTestHistory(RealTag(outbound))
+	tag := RealTag(outbound)
+	g.history.DeleteURLTestHistory(tag)
+	g.access.Lock()
+	if g.failedUntil == nil {
+		g.failedUntil = make(map[string]time.Time)
+	}
+	g.failedUntil[tag] = time.Now().Add(urltestFailureCooldown)
 	if g.selectedOutboundTCP == outbound {
 		g.selectedOutboundTCP = nil
 	}
 	if g.selectedOutboundUDP == outbound {
 		g.selectedOutboundUDP = nil
 	}
-	go g.CheckOutbounds(true)
+	g.access.Unlock()
+	g.logger.Info("outbound ", tag, " marked failed for ", urltestFailureCooldown, " (real dial/IO error)")
+	// Promote another member from existing history; skip force re-probe.
+	g.performUpdateCheck()
 }
 
 func (g *URLTestGroup) wrapFailoverConn(conn net.Conn, outbound adapter.Outbound) net.Conn {
