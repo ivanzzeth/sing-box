@@ -65,8 +65,14 @@ type Box struct {
 
 type Options struct {
 	option.Options
-	Context                    context.Context
-	PlatformLogWriter          log.PlatformWriter
+	Context           context.Context
+	PlatformLogWriter log.PlatformWriter
+	// DefaultLogWriter receives the formatted log lines that would otherwise go
+	// to stderr (i.e. when log.output is unset). Library callers use it to hand
+	// logging to their own sink — e.g. an async ring buffer — so the connection
+	// goroutines that call the logger never touch a file. Colors are disabled
+	// when it is set: a supplied writer is not a terminal.
+	DefaultLogWriter           io.Writer
 	NetworkNamespaceHolderArgs []string
 }
 
@@ -173,9 +179,14 @@ func New(options Options) (*Box, error) {
 	if platformInterface != nil {
 		defaultLogWriter = io.Discard
 	}
+	logOptions := common.PtrValueOrDefault(options.Log)
+	if options.DefaultLogWriter != nil {
+		defaultLogWriter = options.DefaultLogWriter
+		logOptions.DisableColor = true
+	}
 	logFactory, err := log.New(log.Options{
 		Context:        ctx,
-		Options:        common.PtrValueOrDefault(options.Log),
+		Options:        logOptions,
 		Observable:     needClashAPI || needAPIService,
 		DefaultWriter:  defaultLogWriter,
 		BaseTime:       createdAt,
