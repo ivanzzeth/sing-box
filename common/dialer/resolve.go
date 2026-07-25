@@ -100,7 +100,16 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 		return d.dialer.DialContext(ctx, network, destination)
 	}
 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
+	// trust-proxy: record DNS phase timing for the latency breakdown, if the
+	// router set one up for this connection (see adapter.ConnectionTiming).
+	timing := adapter.ConnectionTimingFromContext(ctx)
+	if timing != nil {
+		timing.DNSStart = time.Now()
+	}
 	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
+	if timing != nil {
+		timing.DNSDone = time.Now()
+	}
 	if err != nil {
 		return nil, err
 	}

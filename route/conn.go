@@ -127,6 +127,23 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
+	// trust-proxy: latency breakdown — remoteConn is now fully ready, the
+	// authoritative "done connecting" signal regardless of protocol/TLS. See
+	// adapter.ConnectionTiming.
+	//
+	// Deliberately NOT wrapping remoteConn here to also time the first byte
+	// back (TTFB): doing so broke a copy-loop fast path for at least
+	// shadowsocks2's AEAD-2022 client (io.ReaderFrom/WriterTo-style
+	// optimizations in common/bufio's copy path apparently depend on the
+	// concrete conn type reaching connectionCopy unwrapped) and surfaced a
+	// real, reproducible data race between its writeRequest/readResponse —
+	// confirmed absent on the unwrapped conn across repeated -race runs, and
+	// reproducible every time once wrapped. TTFB isn't worth destabilizing
+	// the data-copy path for every connection; DNS/connect/TLS timing above
+	// don't require touching remoteConn at all.
+	if timing := adapter.ConnectionTimingFromContext(ctx); timing != nil {
+		timing.ConnectDone = time.Now()
+	}
 	if metadata.TLSFragment || metadata.TLSRecordFragment {
 		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)
 	}

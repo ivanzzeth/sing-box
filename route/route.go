@@ -163,6 +163,10 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
+	// trust-proxy: give trackers (and the dial/TLS code below, via this same
+	// ctx) a shared place to record phase timestamps for a latency
+	// breakdown. See adapter.ConnectionTiming's doc comment.
+	ctx = adapter.ContextWithConnectionTiming(ctx, &adapter.ConnectionTiming{DialStart: time.Now()})
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}

@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/badtls"
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
@@ -156,7 +158,19 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
 	if err != nil {
 		return nil, err
 	}
+	// trust-proxy: record TCP-connect/TLS-handshake boundary timing for the
+	// latency breakdown, if the router set one up for this connection (see
+	// adapter.ConnectionTiming). This is the one place shared by every
+	// protocol that wraps its dialer with tls.NewDialer (vless/vmess/trojan/
+	// anytls), so it covers TLS timing without per-protocol patches.
+	timing := adapter.ConnectionTimingFromContext(ctx)
+	if timing != nil {
+		timing.TCPDone = time.Now()
+	}
 	tlsConn, err := aTLS.ClientHandshake(ctx, conn, d.config)
+	if timing != nil {
+		timing.TLSDone = time.Now()
+	}
 	if err != nil {
 		conn.Close()
 		var echErr *tls.ECHRejectionError
