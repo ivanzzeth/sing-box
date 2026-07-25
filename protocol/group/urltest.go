@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -130,46 +131,62 @@ func (s *URLTest) InterfaceUpdated() {
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
-	var outbound adapter.Outbound
-	switch N.NetworkName(network) {
-	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
-	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
+	networkName := N.NetworkName(network)
+	switch networkName {
+	case N.NetworkTCP, N.NetworkUDP:
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if outbound == nil {
-		outbound, _ = s.group.Select(network)
-	}
-	if outbound == nil {
-		return nil, E.New("missing supported outbound")
-	}
-	conn, err := outbound.DialContext(ctx, network, destination)
-	if err == nil {
+	tried := make(map[string]bool)
+	var lastErr error
+	for {
+		outbound := s.group.pickForDial(networkName, tried)
+		if outbound == nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, E.New("missing supported outbound")
+		}
+		tag := RealTag(outbound)
+		tried[tag] = true
+		conn, err := outbound.DialContext(ctx, network, destination)
+		if err != nil {
+			s.logger.ErrorContext(ctx, err)
+			s.group.markFailed(outbound)
+			lastErr = err
+			continue
+		}
+		s.group.setSelected(networkName, outbound)
+		conn = s.group.wrapFailoverConn(conn, outbound)
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
-	if outbound == nil {
-		outbound, _ = s.group.Select(N.NetworkUDP)
-	}
-	if outbound == nil {
-		return nil, E.New("missing supported outbound")
-	}
-	conn, err := outbound.ListenPacket(ctx, destination)
-	if err == nil {
+	tried := make(map[string]bool)
+	var lastErr error
+	for {
+		outbound := s.group.pickForDial(N.NetworkUDP, tried)
+		if outbound == nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, E.New("missing supported outbound")
+		}
+		tag := RealTag(outbound)
+		tried[tag] = true
+		conn, err := outbound.ListenPacket(ctx, destination)
+		if err != nil {
+			s.logger.ErrorContext(ctx, err)
+			s.group.markFailed(outbound)
+			lastErr = err
+			continue
+		}
+		s.group.setSelected(N.NetworkUDP, outbound)
+		conn = s.group.wrapFailoverPacketConn(conn, outbound)
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
 }
 
 func (s *URLTest) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -422,4 +439,143 @@ func (g *URLTestGroup) performUpdateCheck() {
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
+}
+
+// pickForDial chooses the next outbound to try, skipping tags already failed in
+// this dial attempt. Prefers the current selection, then lowest urltest delay,
+// then any remaining member — so a dial/IO failure can immediately fail over
+// without waiting for the periodic probe.
+func (g *URLTestGroup) pickForDial(network string, exclude map[string]bool) adapter.Outbound {
+	var preferred adapter.Outbound
+	switch network {
+	case N.NetworkTCP:
+		preferred = g.selectedOutboundTCP
+	case N.NetworkUDP:
+		preferred = g.selectedOutboundUDP
+	}
+	if preferred != nil && common.Contains(preferred.Network(), network) && !exclude[RealTag(preferred)] {
+		return preferred
+	}
+	var minDelay uint16
+	var minOutbound adapter.Outbound
+	for _, detour := range g.outbounds {
+		if !common.Contains(detour.Network(), network) || exclude[RealTag(detour)] {
+			continue
+		}
+		history := g.history.LoadURLTestHistory(RealTag(detour))
+		if history == nil {
+			continue
+		}
+		if minOutbound == nil || minDelay > history.Delay+g.tolerance {
+			minDelay = history.Delay
+			minOutbound = detour
+		}
+	}
+	if minOutbound != nil {
+		return minOutbound
+	}
+	for _, detour := range g.outbounds {
+		if !common.Contains(detour.Network(), network) || exclude[RealTag(detour)] {
+			continue
+		}
+		return detour
+	}
+	return nil
+}
+
+func (g *URLTestGroup) setSelected(network string, outbound adapter.Outbound) {
+	switch network {
+	case N.NetworkTCP:
+		g.selectedOutboundTCP = outbound
+	case N.NetworkUDP:
+		g.selectedOutboundUDP = outbound
+	}
+}
+
+// markFailed drops the outbound from urltest history and clears it as the
+// sticky selection so the next pick (or a dial retry in the same call) moves on.
+func (g *URLTestGroup) markFailed(outbound adapter.Outbound) {
+	if outbound == nil {
+		return
+	}
+	g.history.DeleteURLTestHistory(RealTag(outbound))
+	if g.selectedOutboundTCP == outbound {
+		g.selectedOutboundTCP = nil
+	}
+	if g.selectedOutboundUDP == outbound {
+		g.selectedOutboundUDP = nil
+	}
+	go g.CheckOutbounds(true)
+}
+
+func (g *URLTestGroup) wrapFailoverConn(conn net.Conn, outbound adapter.Outbound) net.Conn {
+	return &urltestFailoverConn{Conn: conn, group: g, outbound: outbound}
+}
+
+func (g *URLTestGroup) wrapFailoverPacketConn(conn net.PacketConn, outbound adapter.Outbound) net.PacketConn {
+	return &urltestFailoverPacketConn{PacketConn: conn, group: g, outbound: outbound}
+}
+
+// urltestFailoverConn treats early I/O failure (before any successful read) as
+// a probe failure — e.g. TLS RST after a successful dial through a dead proxy.
+type urltestFailoverConn struct {
+	net.Conn
+	group    *URLTestGroup
+	outbound adapter.Outbound
+	readOK   atomic.Bool
+	once     sync.Once
+}
+
+func (c *urltestFailoverConn) noticeFail() {
+	c.once.Do(func() { c.group.markFailed(c.outbound) })
+}
+
+func (c *urltestFailoverConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.readOK.Store(true)
+	}
+	if err != nil && err != io.EOF && !c.readOK.Load() {
+		c.noticeFail()
+	}
+	return n, err
+}
+
+func (c *urltestFailoverConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err != nil && !c.readOK.Load() {
+		c.noticeFail()
+	}
+	return n, err
+}
+
+type urltestFailoverPacketConn struct {
+	net.PacketConn
+	group    *URLTestGroup
+	outbound adapter.Outbound
+	readOK   atomic.Bool
+	once     sync.Once
+}
+
+func (c *urltestFailoverPacketConn) noticeFail() {
+	c.once.Do(func() { c.group.markFailed(c.outbound) })
+}
+
+func (c *urltestFailoverPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if n > 0 {
+		c.readOK.Store(true)
+	}
+	if err != nil && err != io.EOF && !c.readOK.Load() {
+		c.noticeFail()
+	}
+	return n, addr, err
+}
+
+func (c *urltestFailoverPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, addr)
+	if err != nil && !c.readOK.Load() {
+		c.noticeFail()
+	}
+	return n, err
 }
