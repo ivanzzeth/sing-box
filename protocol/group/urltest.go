@@ -543,8 +543,7 @@ func (g *URLTestGroup) setSelected(network string, outbound adapter.Outbound) {
 }
 
 // markFailed drops the outbound from urltest history, puts it in cooldown, and
-// clears sticky selection. Does NOT force an immediate urltest — that would
-// re-probe generate_204 and undo the failure.
+// clears sticky selection. Used when DialContext itself fails (node unreachable).
 func (g *URLTestGroup) markFailed(outbound adapter.Outbound) {
 	if outbound == nil {
 		return
@@ -563,8 +562,25 @@ func (g *URLTestGroup) markFailed(outbound adapter.Outbound) {
 		g.selectedOutboundUDP = nil
 	}
 	g.access.Unlock()
-	g.logger.Info("outbound ", tag, " marked failed for ", urltestFailureCooldown, " (real dial/IO error)")
-	// Promote another member from existing history; skip force re-probe.
+	g.logger.Info("outbound ", tag, " marked failed for ", urltestFailureCooldown, " (dial error)")
+	g.performUpdateCheck()
+}
+
+// markUnhealthy clears sticky selection after a post-dial IO/TLS failure without
+// a long cooldown — destination may be wrong (DNS pollution) while the node is fine.
+func (g *URLTestGroup) markUnhealthy(outbound adapter.Outbound) {
+	if outbound == nil {
+		return
+	}
+	tag := RealTag(outbound)
+	g.history.DeleteURLTestHistory(tag)
+	if g.selectedOutboundTCP == outbound {
+		g.selectedOutboundTCP = nil
+	}
+	if g.selectedOutboundUDP == outbound {
+		g.selectedOutboundUDP = nil
+	}
+	g.logger.Debug("outbound ", tag, " cleared after early IO/TLS failure")
 	g.performUpdateCheck()
 }
 
@@ -587,7 +603,10 @@ type urltestFailoverConn struct {
 }
 
 func (c *urltestFailoverConn) noticeFail() {
-	c.once.Do(func() { c.group.markFailed(c.outbound) })
+	// Early TLS/read failure often means poisoned destination IP (DNS), not a
+	// dead proxy node — clear sticky selection but do NOT cool the outbound
+	// for minutes (that wrongly blackholes a healthy exit).
+	c.once.Do(func() { c.group.markUnhealthy(c.outbound) })
 }
 
 func (c *urltestFailoverConn) Read(p []byte) (int, error) {
@@ -618,7 +637,7 @@ type urltestFailoverPacketConn struct {
 }
 
 func (c *urltestFailoverPacketConn) noticeFail() {
-	c.once.Do(func() { c.group.markFailed(c.outbound) })
+	c.once.Do(func() { c.group.markUnhealthy(c.outbound) })
 }
 
 func (c *urltestFailoverPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
