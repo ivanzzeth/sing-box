@@ -94,6 +94,11 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 			"host":            domain,
 			"dnsMode":         "normal",
 			"processPath":     processPath,
+			// Which inbound user authenticated this connection. Set by inbounds
+			// that authenticate (mixed/http/socks with users); empty otherwise.
+			// Without it a multi-user gateway cannot tell whose traffic is whose,
+			// so it cannot show a person their own connections and only theirs.
+			"user": c.Metadata.User,
 		},
 		"upload":      c.Upload.Load(),
 		"download":    c.Download.Load(),
