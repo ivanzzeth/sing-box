@@ -56,12 +56,18 @@ type InboundContext struct {
 
 	// sniffer
 
-	Protocol     string
-	Domain       string
-	Client       string
-	SniffContext any
-	SnifferNames []string
-	SniffError   error
+	Protocol string
+	Domain   string
+	Client   string
+	// TLSClientHello is the raw ClientHello record captured while sniffing, kept
+	// so an embedder can fingerprint the client (JA3/JA4). Go's
+	// tls.ClientHelloInfo omits the extension list, which those fingerprints are
+	// mostly made of, so the bytes are the only way to compute one. Empty unless
+	// TLS sniffing ran; capped, see common/sniff.
+	TLSClientHello []byte
+	SniffContext   any
+	SnifferNames   []string
+	SniffError     error
 
 	// cache
 
