@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -46,6 +47,8 @@ type Router struct {
 	platformInterface     adapter.PlatformInterface
 	legacyDNSMode         bool
 	rulesAccess           sync.RWMutex
+	queryTrackerAccess    sync.Mutex
+	queryTrackers         atomic.Pointer[[]adapter.DNSQueryTracker]
 	started               bool
 	closing               bool
 }
@@ -779,6 +782,34 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
 	}
 }
 
+// AppendQueryTracker attaches an observer for resolved queries. Trackers are
+// appended once at startup and read on the resolution path, so the slice is
+// swapped atomically rather than locked per query.
+func (r *Router) AppendQueryTracker(tracker adapter.DNSQueryTracker) {
+	if tracker == nil {
+		return
+	}
+	r.queryTrackerAccess.Lock()
+	defer r.queryTrackerAccess.Unlock()
+	next := append(append([]adapter.DNSQueryTracker(nil), r.loadQueryTrackers()...), tracker)
+	r.queryTrackers.Store(&next)
+}
+
+func (r *Router) loadQueryTrackers() []adapter.DNSQueryTracker {
+	if p := r.queryTrackers.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// notifyQuery hands the exchange to every tracker. Errors are reported too: a
+// burst of failures is itself a signal (a DGA sweep is mostly NXDOMAIN).
+func (r *Router) notifyQuery(ctx context.Context, message, response *mDNS.Msg, err error) {
+	for _, t := range r.loadQueryTrackers() {
+		t.RoutedQuery(ctx, message, response, err)
+	}
+}
+
 func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapter.DNSQueryOptions) (*mDNS.Msg, error) {
 	exchangeCtx, earlyResponse, err := r.prepareExchange(ctx, message)
 	if exchangeCtx == nil {
@@ -799,9 +830,11 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 		response, transport, err = r.exchangeLegacy(ctx, exchangeCtx, message, options)
 	}
 	if err != nil {
+		r.notifyQuery(ctx, message, nil, err)
 		return nil, err
 	}
 	r.recordReverseMapping(message, response, transport)
+	r.notifyQuery(ctx, message, response, nil)
 	return response, nil
 }
 
@@ -831,10 +864,12 @@ func (r *Router) ExchangeAsync(ctx context.Context, message *mDNS.Msg, options a
 
 func (r *Router) finishExchangeAsync(message *mDNS.Msg, transport adapter.DNSTransport, response *mDNS.Msg, err error, callback func(response *mDNS.Msg, err error)) {
 	if err != nil {
+		r.notifyQuery(context.Background(), message, nil, err)
 		callback(nil, err)
 		return
 	}
 	r.recordReverseMapping(message, response, transport)
+	r.notifyQuery(context.Background(), message, response, nil)
 	callback(response, nil)
 }
 

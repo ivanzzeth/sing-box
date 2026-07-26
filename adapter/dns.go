@@ -15,8 +15,22 @@ import (
 	"github.com/miekg/dns"
 )
 
+// DNSQueryTracker observes resolved queries. It is the DNS-side counterpart of
+// ConnectionTracker: an embedder can watch what is being *asked for*, not only
+// what was eventually dialled. Queries that never become a connection (NXDOMAIN
+// sweeps, TXT tunnels) are invisible to a connection tracker, and those are
+// exactly the shapes worth watching.
+//
+// Called on the resolution path, so implementations must return promptly and
+// must not re-enter the router.
+type DNSQueryTracker interface {
+	RoutedQuery(ctx context.Context, message *dns.Msg, response *dns.Msg, err error)
+}
+
 type DNSRouter interface {
 	Lifecycle
+	// AppendQueryTracker attaches an observer for every resolved query.
+	AppendQueryTracker(tracker DNSQueryTracker)
 	Exchange(ctx context.Context, message *dns.Msg, options DNSQueryOptions) (*dns.Msg, error)
 	ExchangeAsync(ctx context.Context, message *dns.Msg, options DNSQueryOptions, callback func(response *dns.Msg, err error))
 	Lookup(ctx context.Context, domain string, options DNSQueryOptions) ([]netip.Addr, error)
