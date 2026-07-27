@@ -123,6 +123,11 @@ func (s *URLTest) InterfaceUpdated() {
 	if group == nil {
 		return
 	}
+	// Before the pause check, not after: the failures are stale either way, and a
+	// device that is asleep or has no network is exactly the case where they pile
+	// up. Clearing here means the group is already clean when it resumes, instead
+	// of waiting out a cooldown earned on a network it is no longer on.
+	group.clearFailures()
 	if group.pause.IsDevicePaused() || group.pause.IsNetworkPaused() {
 		return
 	}
@@ -466,6 +471,28 @@ func (g *URLTestGroup) performUpdateCheck() {
 // urltestFailureCooldownout keeps a node out of Auto after a real dial/IO failure
 // so the periodic generate_204 probe cannot immediately put it back.
 const urltestFailureCooldown = 5 * time.Minute
+
+// clearFailures forgets every recorded failure and drops sticky selection.
+//
+// Called when the default interface changes. The cooldown answers "is this node
+// broken?", and it answers it by observing one network path; when that path is
+// replaced, every answer it holds was about somewhere else. A network change also
+// fails every node simultaneously, so without this the whole group goes into
+// cooldown at once, CheckOutbounds discards the probes that would recover it
+// ("available but in failure cooldown, ignoring probe"), and the group has no
+// selectable member for the full five minutes — no egress at all, recoverable
+// only by rebuilding the instance, which is how this was found: switching out of
+// TUN and back allocates a fresh map.
+func (g *URLTestGroup) clearFailures() {
+	g.access.Lock()
+	defer g.access.Unlock()
+	for tag := range g.failedUntil {
+		delete(g.failedUntil, tag)
+	}
+	// The selection was reached over the old path, so it goes with the failures.
+	g.selectedOutboundTCP = nil
+	g.selectedOutboundUDP = nil
+}
 
 func (g *URLTestGroup) isCooled(tag string) bool {
 	g.access.Lock()
