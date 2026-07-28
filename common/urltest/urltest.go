@@ -3,6 +3,7 @@ package urltest
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -130,6 +131,14 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		return
 	}
 	resp.Body.Close()
+	// Any HTTP answer used to count as success, so a node that dials a
+	// landing page (or returns 403/5xx) could win urltest with a tiny delay
+	// and then break real destinations. Require 2xx — generate_204 /
+	// cp.cloudflare.com answer 204 when the exit actually reaches them.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		err = fmt.Errorf("unexpected status %d", resp.StatusCode)
+		return
+	}
 	t = uint16(time.Since(start) / time.Millisecond)
 	return
 }
