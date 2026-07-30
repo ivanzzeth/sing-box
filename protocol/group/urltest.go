@@ -154,6 +154,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		}
 		tag := RealTag(outbound)
 		tried[tag] = true
+		dialStart := time.Now()
 		conn, err := outbound.DialContext(ctx, network, destination)
 		if err != nil {
 			s.logger.ErrorContext(ctx, err)
@@ -161,6 +162,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 			lastErr = err
 			continue
 		}
+		s.group.observe(tag, true, time.Since(dialStart), nil)
 		s.group.setSelected(networkName, outbound)
 		conn = s.group.wrapFailoverConn(conn, outbound)
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
@@ -181,6 +183,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		}
 		tag := RealTag(outbound)
 		tried[tag] = true
+		dialStart := time.Now()
 		conn, err := outbound.ListenPacket(ctx, destination)
 		if err != nil {
 			s.logger.ErrorContext(ctx, err)
@@ -188,6 +191,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 			lastErr = err
 			continue
 		}
+		s.group.observe(tag, true, time.Since(dialStart), nil)
 		s.group.setSelected(N.NetworkUDP, outbound)
 		conn = s.group.wrapFailoverPacketConn(conn, outbound)
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
@@ -231,6 +235,10 @@ type URLTestGroup struct {
 	// and resurrects nodes that pass the health URL but fail real TLS (e.g. to
 	// api2.cursor.sh / accounts.google.com).
 	failedUntil map[string]time.Time
+	// scorer ranks members by observed real-traffic quality (trust-proxy
+	// addition). nil is the normal upstream case and must stay byte-identical
+	// to the un-scored behaviour — that is the regression insurance.
+	scorer adapter.OutboundScorer
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -265,7 +273,52 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
 		failedUntil:                  make(map[string]time.Time),
+		scorer:                       service.FromContext[adapter.OutboundScorer](ctx),
 	}, nil
+}
+
+// score returns the member's quality score and whether it may be preferred.
+// Without a scorer every member scores identically, so ordering collapses to
+// pure latency — exactly the upstream behaviour.
+func (g *URLTestGroup) score(tag string) (float64, bool) {
+	if g.scorer == nil {
+		return 0, true
+	}
+	return g.scorer.Score(tag)
+}
+
+// betterScore reports whether challenger beats incumbent on score alone.
+// Differences below the scorer's tie margin are "the same score" and are left
+// for the latency tolerance to decide; a non-preferred member (open circuit
+// breaker) always loses to a preferred one.
+//
+// It only ever *reorders* candidates. A non-preferred member is still a
+// candidate — see the contract on adapter.OutboundScorer: excluding unhealthy
+// members can empty the group entirely, which is the no-egress incident in
+// urltest_cooldown_test.go.
+func (g *URLTestGroup) betterScore(challenger, incumbent float64, chalOK, incOK bool) (better bool, decided bool) {
+	if g.scorer == nil {
+		return false, false
+	}
+	if chalOK != incOK {
+		return chalOK, true
+	}
+	margin := g.scorer.TieMargin()
+	if challenger > incumbent+margin {
+		return true, true
+	}
+	if incumbent > challenger+margin {
+		return false, true
+	}
+	return false, false // same score bucket: fall through to latency
+}
+
+// observe forwards one real dial outcome to the scorer, if any.
+func (g *URLTestGroup) observe(tag string, success bool, latency time.Duration, err error) {
+	if g.scorer == nil {
+		return
+	}
+	g.scorer.Observe(tag, success, latency, err)
 }
 
 func (g *URLTestGroup) PostStart() {
@@ -309,12 +362,15 @@ func (g *URLTestGroup) Close() error {
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minDelay uint16
 	var minOutbound adapter.Outbound
+	var minScore float64
+	minPreferred := true
 	switch network {
 	case N.NetworkTCP:
 		if g.selectedOutboundTCP != nil && !g.isCooled(RealTag(g.selectedOutboundTCP)) {
 			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP)); history != nil {
 				minOutbound = g.selectedOutboundTCP
 				minDelay = history.Delay
+				minScore, minPreferred = g.score(RealTag(g.selectedOutboundTCP))
 			}
 		}
 	case N.NetworkUDP:
@@ -322,6 +378,7 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP)); history != nil {
 				minOutbound = g.selectedOutboundUDP
 				minDelay = history.Delay
+				minScore, minPreferred = g.score(RealTag(g.selectedOutboundUDP))
 			}
 		}
 	}
@@ -333,12 +390,36 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if history == nil {
 			continue
 		}
-		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
-			minDelay = history.Delay
-			minOutbound = detour
+		score, preferred := g.score(RealTag(detour))
+		win, decided := g.betterScore(score, minScore, preferred, minPreferred)
+		switch {
+		case minDelay == 0: // nothing chosen yet
+		case decided: // score alone settles it, in either direction
+			if !win {
+				continue
+			}
+		default: // same score bucket => the existing latency tolerance decides
+			if minDelay <= history.Delay+g.tolerance {
+				continue
+			}
 		}
+		minDelay = history.Delay
+		minOutbound = detour
+		minScore, minPreferred = score, preferred
 	}
 	if minOutbound == nil {
+		// No probe history yet. Take the first member the breaker still allows;
+		// only if every one of them is tripped do we fall back to any member at
+		// all (demote, never exclude).
+		for _, detour := range g.outbounds {
+			if !common.Contains(detour.Network(), network) || g.isCooled(RealTag(detour)) {
+				continue
+			}
+			if _, preferred := g.score(RealTag(detour)); !preferred {
+				continue
+			}
+			return detour, false
+		}
 		for _, detour := range g.outbounds {
 			if !common.Contains(detour.Network(), network) || g.isCooled(RealTag(detour)) {
 				continue
@@ -509,9 +590,13 @@ func (g *URLTestGroup) isCooled(tag string) bool {
 }
 
 // pickForDial chooses the next outbound to try, skipping tags already failed in
-// this dial attempt. Prefers the current selection, then lowest urltest delay,
-// then any remaining member — so a dial/IO failure can immediately fail over
-// without waiting for the periodic probe.
+// this dial attempt. Prefers the current selection, then the best score (ties
+// broken by lowest urltest delay), then any remaining member — so a dial/IO
+// failure can immediately fail over without waiting for the periodic probe.
+//
+// This runs on the NEW-connection path only. Established connections keep the
+// exit they were dialed on: scoring steers what comes next, it never migrates
+// traffic that is already flowing.
 func (g *URLTestGroup) pickForDial(network string, exclude map[string]bool) adapter.Outbound {
 	var preferred adapter.Outbound
 	switch network {
@@ -521,10 +606,16 @@ func (g *URLTestGroup) pickForDial(network string, exclude map[string]bool) adap
 		preferred = g.selectedOutboundUDP
 	}
 	if preferred != nil && common.Contains(preferred.Network(), network) && !exclude[RealTag(preferred)] && !g.isCooled(RealTag(preferred)) {
-		return preferred
+		// Sticky selection still yields to a tripped breaker: it is the one
+		// signal that says "this member cannot serve right now".
+		if _, ok := g.score(RealTag(preferred)); ok {
+			return preferred
+		}
 	}
 	var minDelay uint16
 	var minOutbound adapter.Outbound
+	var minScore float64
+	minPreferred := true
 	for _, detour := range g.outbounds {
 		tag := RealTag(detour)
 		if !common.Contains(detour.Network(), network) || exclude[tag] || g.isCooled(tag) {
@@ -534,14 +625,38 @@ func (g *URLTestGroup) pickForDial(network string, exclude map[string]bool) adap
 		if history == nil {
 			continue
 		}
-		if minOutbound == nil || minDelay > history.Delay+g.tolerance {
-			minDelay = history.Delay
-			minOutbound = detour
+		score, ok := g.score(tag)
+		win, decided := g.betterScore(score, minScore, ok, minPreferred)
+		switch {
+		case minOutbound == nil:
+		case decided:
+			if !win {
+				continue
+			}
+		default:
+			if minDelay <= history.Delay+g.tolerance {
+				continue
+			}
 		}
+		minDelay = history.Delay
+		minOutbound = detour
+		minScore, minPreferred = score, ok
 	}
 	if minOutbound != nil {
 		return minOutbound
 	}
+	// No probe history: prefer a member whose breaker is closed…
+	for _, detour := range g.outbounds {
+		tag := RealTag(detour)
+		if !common.Contains(detour.Network(), network) || exclude[tag] || g.isCooled(tag) {
+			continue
+		}
+		if _, ok := g.score(tag); !ok {
+			continue
+		}
+		return detour
+	}
+	// …but never end up with nothing to dial just because every breaker is open.
 	for _, detour := range g.outbounds {
 		tag := RealTag(detour)
 		if !common.Contains(detour.Network(), network) || exclude[tag] || g.isCooled(tag) {
@@ -576,6 +691,7 @@ func (g *URLTestGroup) markFailed(outbound adapter.Outbound) {
 		return
 	}
 	tag := RealTag(outbound)
+	g.observe(tag, false, 0, E.New("dial failed"))
 	g.history.DeleteURLTestHistory(tag)
 	g.access.Lock()
 	if g.failedUntil == nil {
@@ -600,6 +716,7 @@ func (g *URLTestGroup) markUnhealthy(outbound adapter.Outbound) {
 		return
 	}
 	tag := RealTag(outbound)
+	g.observe(tag, false, 0, E.New("early IO/TLS failure"))
 	g.history.DeleteURLTestHistory(tag)
 	if g.selectedOutboundTCP == outbound {
 		g.selectedOutboundTCP = nil
