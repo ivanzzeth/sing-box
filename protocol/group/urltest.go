@@ -487,15 +487,20 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		if checked[realTag] {
 			continue
 		}
-		if g.isCooled(realTag) {
-			// Real traffic already failed this node; do not let generate_204
-			// resurrect it until the cooldown expires.
+		// Dial-failure cooldown must not skip the probe entirely. Cooldown answers
+		// "keep this node out of Select for a while because generate_204 can pass
+		// while real TLS still fails". The scorer's breaker/blackhole answers a
+		// different question and only advances on Observe/NoteProbe — if we never
+		// probe cooled members, the breaker stays Open after its 30s delay with
+		// nothing to TryAcquirePermit, which reads as a permanent ban.
+		cooled := g.isCooled(realTag)
+		if cooled {
 			g.history.DeleteURLTestHistory(realTag)
-			continue
-		}
-		history := g.history.LoadURLTestHistory(realTag)
-		if !force && history != nil && time.Since(history.Time) < g.interval {
-			continue
+		} else {
+			history := g.history.LoadURLTestHistory(realTag)
+			if !force && history != nil && time.Since(history.Time) < g.interval {
+				continue
+			}
 		}
 		checked[realTag] = true
 		p, loaded := g.outbound.Outbound(realTag)
@@ -509,19 +514,27 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
 				g.history.DeleteURLTestHistory(realTag)
-			} else if g.isCooled(realTag) {
-				g.logger.Debug("outbound ", tag, " available but in failure cooldown, ignoring probe")
-				g.history.DeleteURLTestHistory(realTag)
-			} else {
-				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
-				g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: t,
-				})
-				resultAccess.Lock()
-				result[tag] = t
-				resultAccess.Unlock()
+				// Probe failure deliberately does not Observe(false): generate_204
+				// is not user traffic and must not reopen breakers on its own.
+				return nil, nil
 			}
+			// Bytes came back through the member — heal blackhole/breaker even
+			// when selection cooldown still applies.
+			if g.scorer != nil {
+				g.scorer.NoteProbe(realTag, true, time.Duration(t)*time.Millisecond)
+			}
+			if cooled {
+				g.logger.Debug("outbound ", tag, " available during cooldown: ", t, "ms (scorer healed; still cooled for selection)")
+				return nil, nil
+			}
+			g.logger.Debug("outbound ", tag, " available: ", t, "ms")
+			g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+				Time:  time.Now(),
+				Delay: t,
+			})
+			resultAccess.Lock()
+			result[tag] = t
+			resultAccess.Unlock()
 			return nil, nil
 		})
 	}
@@ -549,8 +562,10 @@ func (g *URLTestGroup) performUpdateCheck() {
 	}
 }
 
-// urltestFailureCooldownout keeps a node out of Auto after a real dial/IO failure
-// so the periodic generate_204 probe cannot immediately put it back.
+// urltestFailureCooldown keeps a node out of Select after a real dial/IO failure.
+// Probes still run (and heal the scorer via NoteProbe); only the delay history
+// used for ranking is withheld until the cooldown expires — generate_204 can
+// pass while real TLS still fails, which is why selection stays cool.
 const urltestFailureCooldown = 5 * time.Minute
 
 // clearFailures forgets every recorded failure and drops sticky selection.

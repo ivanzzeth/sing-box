@@ -16,11 +16,13 @@ import (
 // every node fails at once, so all of them land in cooldown together.
 //
 // What made this hard to see: InterfaceUpdated does re-probe, and the probes
-// succeed on the new network. CheckOutbounds then throws each result away
-// ("available but in failure cooldown, ignoring probe") and deletes the delay
-// history, so Auto has nothing to select. The only escape was rebuilding the
-// box, which is why the symptom was reported as "switch out of TUN and back and
-// it works again" — that rebuild allocates a fresh failedUntil map.
+// succeed on the new network — but selection still withheld delay history while
+// cooled, so Auto had nothing to pick. clearFailures on interface change is
+// what restores selection; without it the only escape was rebuilding the box
+// ("switch out of TUN and back"), which allocates a fresh failedUntil map.
+//
+// Cooled members are still probed for scorer recovery (NoteProbe); only the
+// ranking history stays suppressed until cooldown expires or clearFailures.
 func TestInterfaceUpdateClearsFailureCooldown(t *testing.T) {
 	g := &URLTestGroup{
 		failedUntil: map[string]time.Time{
@@ -38,8 +40,8 @@ func TestInterfaceUpdateClearsFailureCooldown(t *testing.T) {
 
 	for _, tag := range []string{"hk-01", "jp-02"} {
 		if g.isCooled(tag) {
-			t.Fatalf("%s is still in cooldown after a network change, so its successful probes "+
-				"keep being discarded and Auto has no healthy node", tag)
+			t.Fatalf("%s is still in cooldown after a network change, so Select keeps "+
+				"withholding delay history and Auto has no healthy node", tag)
 		}
 	}
 }

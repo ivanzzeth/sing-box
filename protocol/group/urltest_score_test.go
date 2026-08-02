@@ -36,6 +36,7 @@ type fakeScorer struct {
 	blocked   map[string]bool
 	margin    float64
 	observed  []string
+	probed    []string
 	lastOK    map[string]bool
 	lastDelay map[string]time.Duration
 }
@@ -62,6 +63,13 @@ func (f *fakeScorer) Observe(tag string, success bool, latency time.Duration, er
 	f.observed = append(f.observed, tag)
 	f.lastOK[tag] = success
 	f.lastDelay[tag] = latency
+}
+
+func (f *fakeScorer) NoteProbe(tag string, success bool, latency time.Duration) {
+	if success {
+		f.probed = append(f.probed, tag)
+		f.lastDelay[tag] = latency
+	}
 }
 
 func (f *fakeScorer) TieMargin() float64 { return f.margin }

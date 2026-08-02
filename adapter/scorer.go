@@ -30,7 +30,21 @@ type OutboundScorer interface {
 	// Observe reports one real dial outcome. Latency is meaningful only when
 	// success is true — a failure's duration measures a timeout, not speed.
 	// Must return immediately.
+	//
+	// A successful dial must NOT clear a blackhole verdict: blackholes complete
+	// their own handshake (so dials "succeed") and then relay nothing. Clearing
+	// on dial success would undo the verdict on the very next attempt.
 	Observe(tag string, success bool, latency time.Duration, err error)
+
+	// NoteProbe reports one urltest / delay probe result. A successful probe
+	// fetched bytes through the member (generate_204), which is conclusive
+	// counter-evidence for a blackhole — and the only recovery path that does
+	// not require demoted members to already be carrying user traffic (they
+	// never are: score 0 sorts them last). Probe failures are ignored: they
+	// must not re-open breakers on a path that is not the user's.
+	// Optional: older scorers without this method are fine — groups type-assert.
+	// Kept on the interface so the production scorer always implements it.
+	NoteProbe(tag string, success bool, latency time.Duration)
 
 	// TieMargin is the score difference below which two members count as
 	// equal, leaving the existing latency tolerance to break the tie. Read
