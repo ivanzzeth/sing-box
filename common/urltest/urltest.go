@@ -22,12 +22,83 @@ type HistoryStorage struct {
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
 	updateHooks  []*observable.Subscriber[struct{}]
+
+	probeAccess sync.Mutex
+	probes      map[string]probeState
+}
+
+// probeState is the per-outbound probe bookkeeping behind ClaimProbe.
+type probeState struct {
+	inFlight bool
+	done     time.Time // when the last probe finished
 }
 
 func NewHistoryStorage() *HistoryStorage {
 	return &HistoryStorage{
 		delayHistory: make(map[string]*adapter.URLTestHistory),
+		probes:       make(map[string]probeState),
 	}
+}
+
+// ClaimProbe reserves tag for a URL test, returning false when another group is
+// already probing it or finished one less than window ago.
+//
+// One outbound usually belongs to several groups at once — Auto, a region
+// group, its per-country group — and each group probes all of its own members.
+// The delay history cannot deduplicate that work:
+//
+//   - Every group's ticker starts from the same box, so they fire together and
+//     all of them read the history before any probe has written to it. Measured
+//     on a 36-node subscription with 18 groups (103 memberships): a box start
+//     produced 103 probe connections in one second, every node dialled three
+//     times.
+//   - A probe that fails, or a member in dial cooldown, has its history entry
+//     *deleted* — so from then on the freshness check never matches and every
+//     group re-probes it every interval, forever. The nodes being probed most
+//     pointlessly are exactly the ones the old check stopped covering.
+//
+// This guard is keyed on the attempt rather than on its result, so both cases
+// collapse to one probe per outbound per window. The storage is per-box (groups
+// take it from the box's service context), so separate boxes in one process —
+// tests, selftest — never coalesce each other's probes.
+func (s *HistoryStorage) ClaimProbe(tag string, window time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	s.probeAccess.Lock()
+	defer s.probeAccess.Unlock()
+	st := s.probes[tag]
+	if st.inFlight {
+		return false
+	}
+	if window > 0 && !st.done.IsZero() && time.Since(st.done) < window {
+		return false
+	}
+	st.inFlight = true
+	s.probes[tag] = st
+	return true
+}
+
+// ReleaseProbe ends the claim taken by ClaimProbe and starts the window. It
+// must run whatever the probe's outcome was; see ClaimProbe.
+func (s *HistoryStorage) ReleaseProbe(tag string) {
+	if s == nil {
+		return
+	}
+	s.probeAccess.Lock()
+	defer s.probeAccess.Unlock()
+	s.probes[tag] = probeState{done: time.Now()}
+}
+
+// ForgetProbe drops the bookkeeping for tag, so the next ClaimProbe succeeds
+// immediately. For members that left the group.
+func (s *HistoryStorage) ForgetProbe(tag string) {
+	if s == nil {
+		return
+	}
+	s.probeAccess.Lock()
+	defer s.probeAccess.Unlock()
+	delete(s.probes, tag)
 }
 
 func (s *HistoryStorage) AddUpdateHook(hook *observable.Subscriber[struct{}]) {

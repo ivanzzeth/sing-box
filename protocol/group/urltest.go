@@ -496,11 +496,13 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		cooled := g.isCooled(realTag)
 		if cooled {
 			g.history.DeleteURLTestHistory(realTag)
-		} else {
-			history := g.history.LoadURLTestHistory(realTag)
-			if !force && history != nil && time.Since(history.Time) < g.interval {
-				continue
-			}
+		}
+		// One probe per member per interval, across every group it belongs to.
+		// The delay history alone cannot enforce that: groups fire together so
+		// they all read it before anyone writes, and a failed or cooled probe
+		// deletes its entry outright. See HistoryStorage.ClaimProbe.
+		if !force && !g.history.ClaimProbe(realTag, g.interval) {
+			continue
 		}
 		checked[realTag] = true
 		p, loaded := g.outbound.Outbound(realTag)
@@ -510,6 +512,11 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		b.Go(realTag, func() (any, error) {
 			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
 			defer cancel()
+			// Whatever the outcome: the window that keeps the other groups off
+			// this member starts when the attempt ends, not when it succeeds.
+			if !force {
+				defer g.history.ReleaseProbe(realTag)
+			}
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
